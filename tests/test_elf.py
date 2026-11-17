@@ -10,13 +10,17 @@ import os
 import io
 import re
 import socket
+import struct
 import sys
+import tempfile
 import time
 import threading
 from ctypes import *
 sys.path.append("..")
 
 from typing import Any, Sequence
+
+from unicorn import UC_PROT_READ
 
 from qiling import Qiling
 from qiling.const import QL_ARCH, QL_OS, QL_INTERCEPT, QL_STOP, QL_VERBOSE
@@ -25,6 +29,56 @@ from qiling.extensions import pipe
 from qiling.os.const import STRING
 from qiling.os.posix import syscall
 from qiling.os.mapper import QlFsMappedObject
+
+
+# ELF segment permission flags
+PF_X = 1
+PF_W = 2
+PF_R = 4
+
+# exit(0) shellcode per arch
+EXIT_CODE = {
+    'x86_64' : b'\xb8\x3c\x00\x00\x00\x31\xff\x0f\x05',   # mov eax, 60; xor edi, edi; syscall
+    'arm64'  : b'\xa8\x0b\x80\xd2\x01\x00\x00\xd4',       # mov x8, 93; svc #0
+}
+
+EM_MACH = {'x86_64': 62, 'arm64': 183}
+
+
+def make_packed_elf(arch: str, segs: Sequence[tuple], entry: int) -> str:
+    """Craft an ELF64 file with the specified PT_LOAD segments and store it in a
+    temporary file. Used to emulate hand-crafted / packed binaries whose segments
+    share pages and use p_align values smaller than the page size.
+
+    Args:
+        arch: either 'x86_64' or 'arm64'
+        segs: sequence of (file offset, vaddr, data, memsz, flags, p_align) tuples
+        entry: entry point virtual address
+
+    Returns: path of the generated file
+    """
+
+    ident = b'\x7fELF' + bytes([2, 1, 1, 0]) + b'\x00' * 8
+    ehdr = struct.pack('<16sHHIQQQIHHHHHH', ident, 2, EM_MACH[arch], 1, entry,
+                       64, 0, 0, 64, 56, len(segs), 64, 0, 0)
+
+    phdrs = b''.join(struct.pack('<IIQQQQQQ', 1, flags, off, vaddr, vaddr, len(data), memsz, align)
+                     for off, vaddr, data, memsz, flags, align in segs)
+
+    size = max([64 + len(phdrs)] + [off + len(data) for off, _, data, *_ in segs])
+    buf = bytearray(size)
+    buf[0:64] = ehdr
+    buf[64:64 + len(phdrs)] = phdrs
+
+    for off, _, data, *_ in segs:
+        buf[off:off + len(data)] = data
+
+    fd, path = tempfile.mkstemp(suffix='.elf')
+
+    with os.fdopen(fd, 'wb') as f:
+        f.write(buf)
+
+    return path
 
 
 class ELFTest(unittest.TestCase):
@@ -73,6 +127,116 @@ class ELFTest(unittest.TestCase):
         ql.run()
 
         del ql
+
+    def test_elf_linux_x8664_shared_page_segments(self):
+        # packed binaries may cram code and data segments into the same page and
+        # use p_align values smaller than the page size
+        text = EXIT_CODE['x86_64'].ljust(0x600, b'\x90')
+        data = bytes((i * 7 + 3) & 0xff for i in range(0x600))
+
+        path = make_packed_elf('x86_64', [
+            (0x200, 0x400200, text, 0x600, PF_R | PF_X, 0x10),
+            (0x800, 0x400800, data, 0x600, PF_R | PF_W, 0x10)
+        ], entry=0x400200)
+
+        try:
+            ql = Qiling([path], "../examples/rootfs/x8664_linux")
+
+            # image bounds, brk and memory map should all agree with one another
+            image = ql.loader.images[0]
+            self.assertEqual((image.base, image.end), (0x400000, 0x401000))
+            self.assertGreaterEqual(ql.loader.brk_address, image.end)
+
+            # the shared page should be mapped with the union of both segments perms
+            mapinfo = [entry for entry in ql.mem.get_mapinfo() if entry[4] == path]
+            self.assertEqual([(s, e, perms) for s, e, perms, *_ in mapinfo], [(0x400000, 0x401000, 'rwx')])
+
+            # every byte of segment data should be loaded
+            self.assertEqual(bytes(ql.mem.read(0x400800, len(data))), data)
+
+            # code should be executable all the way to a clean exit
+            ql.run()
+
+            # protecting the entire image should be reflected by the memory map
+            ql.mem.protect(image.base, image.end - image.base, UC_PROT_READ)
+            mapinfo = [entry for entry in ql.mem.get_mapinfo() if entry[4] == path]
+            self.assertEqual([(s, e, perms) for s, e, perms, *_ in mapinfo], [(0x400000, 0x401000, 'r--')])
+
+            del ql
+        finally:
+            os.remove(path)
+
+    def test_elf_linux_arm64_nested_segments(self):
+        # a bss-heavy segment whose page span encloses a later, smaller segment:
+        # the image should cover the entire span and brk should start past it
+        text = EXIT_CODE['arm64'].ljust(0x100, b'\x90')
+        data = bytes((i * 13 + 1) & 0xff for i in range(0x100))
+
+        path = make_packed_elf('arm64', [
+            (0x200, 0x10000, text, 0x5000, PF_R | PF_X, 0x10),
+            (0x300, 0x10800, data, 0x100, PF_R | PF_W, 0x10)
+        ], entry=0x10000)
+
+        try:
+            ql = Qiling([path], "../examples/rootfs/arm64_linux")
+
+            image = ql.loader.images[0]
+            self.assertEqual((image.base, image.end), (0x10000, 0x15000))
+            self.assertGreaterEqual(ql.loader.brk_address, image.end)
+
+            # the entire image span should be mapped, including the bss-only pages
+            self.assertTrue(ql.mem.is_mapped(image.base, image.end - image.base))
+
+            # every byte of segment data should be loaded
+            self.assertEqual(bytes(ql.mem.read(0x10800, len(data))), data)
+
+            ql.run()
+
+            del ql
+        finally:
+            os.remove(path)
+
+    def test_elf_linux_x8664_protect_across_regions(self):
+        # protecting a range that spans several adjacent map entries should
+        # update all of them
+        text = EXIT_CODE['x86_64'].ljust(0x1000, b'\x90')
+        data = bytes((i * 5 + 1) & 0xff for i in range(0x1000))
+
+        path = make_packed_elf('x86_64', [
+            (0x200,  0x400000, text, 0x1000, PF_R | PF_X, 0x1000),
+            (0x1200, 0x401000, data, 0x1000, PF_R | PF_W, 0x1000)
+        ], entry=0x400000)
+
+        try:
+            ql = Qiling([path], "../examples/rootfs/x8664_linux")
+
+            image = ql.loader.images[0]
+            mapinfo = [entry for entry in ql.mem.get_mapinfo() if entry[4] == path]
+            self.assertEqual([(s, e, perms) for s, e, perms, *_ in mapinfo], [(0x400000, 0x401000, 'r-x'), (0x401000, 0x402000, 'rw-')])
+
+            ql.mem.protect(image.base, image.end - image.base, UC_PROT_READ)
+
+            mapinfo = [entry for entry in ql.mem.get_mapinfo() if entry[4] == path]
+            self.assertEqual([(s, e, perms) for s, e, perms, *_ in mapinfo], [(0x400000, 0x401000, 'r--'), (0x401000, 0x402000, 'r--')])
+
+            del ql
+        finally:
+            os.remove(path)
+
+    def test_elf_linux_x8664_segment_out_of_bounds(self):
+        # a segment whose memory range exceeds the emulated address space should
+        # be rejected with a qiling exception that reports the conflicting range
+        path = make_packed_elf('x86_64', [
+            (0x200, 0xfffffffffffff000, EXIT_CODE['x86_64'].ljust(0x100, b'\x90'), 0x2000, PF_R | PF_X, 0x1000)
+        ], entry=0xfffffffffffff000)
+
+        try:
+            with self.assertRaises(QlErrorELFFormat) as ctx:
+                Qiling([path], "../examples/rootfs/x8664_linux")
+
+            self.assertIn('0xfffffffffffff000', str(ctx.exception))
+        finally:
+            os.remove(path)
 
     def _test_elf_linux_x86_snapshot_restore_common(self, reg=False, ctx=False):
         rootfs = "../examples/rootfs/x86_linux"

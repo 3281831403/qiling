@@ -7,7 +7,7 @@ import io
 import os
 
 from enum import IntEnum
-from typing import Any, AnyStr, Optional, Sequence, Mapping, Tuple
+from typing import Any, AnyStr, List, Optional, Sequence, Mapping, Tuple
 
 from elftools.common.utils import preserve_stream_pos
 from elftools.elf.constants import P_FLAGS, SH_FLAGS
@@ -154,62 +154,66 @@ class QlLoaderELF(QlLoader):
 
             # determine the memory regions that need to be mapped in order to load the segments.
             # note that region boundaries are aligned to page, which means they may be larger than
-            # the segment they contain. to reduce mapping clutter, adjacent regions with the same
-            # perms are consolidated into one contigous memory region
-            load_regions: Sequence[Tuple[int, int, int]] = []
+            # the segment they contain.
+            #
+            # segments whose p_align is smaller than the page size (common in hand-crafted and
+            # packed binaries) may share one or more pages with other segments. such pages are
+            # mapped with the union of their sharing segments permissions
+            spans: List[Tuple[int, int, int]] = []
 
             # iterate over loadable segments
             for seg in load_segments:
-                lbound = self.ql.mem.align(load_address + seg['p_vaddr'])
-                ubound = self.ql.mem.align_up(load_address + seg['p_vaddr'] + seg['p_memsz'])
-                perms = QlLoaderELF.seg_perm_to_uc_prot(seg['p_flags'])
+                seg_start = load_address + seg['p_vaddr']
+                seg_end = seg_start + seg['p_memsz']
 
-                if load_regions:
-                    prev_lbound, prev_ubound, prev_perms = load_regions[-1]
+                # segments whose memory range does not fit the emulated address space cannot be loaded
+                if seg_end - 1 > self.ql.mem.max_mem_addr:
+                    raise QlErrorELFFormat(f'segment range {seg_start:#x}-{seg_end - 1:#x} exceeds the emulated address space')
 
-                    # new region starts where the previous one ended
-                    if lbound == prev_ubound:
-                        # same perms? extend previous memory region
-                        if perms == prev_perms:
-                            load_regions[-1] = (prev_lbound, ubound, prev_perms)
+                lbound = self.ql.mem.align(seg_start)
+                ubound = self.ql.mem.align_up(seg_end)
 
-                        # different perms? start a new one
-                        else:
-                            load_regions.append((lbound, ubound, perms))
+                # there might be a segment with zero size. in this case, it has no span
+                if ubound > lbound:
+                    perms = QlLoaderELF.seg_perm_to_uc_prot(seg['p_flags'])
+                    spans.append((lbound, ubound, perms))
 
-                    # start a new memory region
-                    elif lbound > prev_ubound:
-                        load_regions.append((lbound, ubound, perms))
+            # split spans at every span boundary and unite the perms of overlapping parts.
+            # to reduce mapping clutter, adjacent parts with the same perms are consolidated
+            # into one contigous memory region
+            bounds = sorted({bound for lbound, ubound, _ in spans for bound in (lbound, ubound)})
 
-                    # overlapping segments? something probably went wrong
-                    elif lbound < prev_ubound:
-                        # EDL ELF files use 0x400 bytes pages, which might make some segments look as if they
-                        # start at the same segment as their predecessor. though that is fixable, unicorn
-                        # supports only 0x1000 bytes pages; this becomes problematic when using mem.protect
-                        #
-                        # this workaround unifies such "overlapping" segments, which may apply more permissive
-                        # protection flags to that memory region.
-                        if self.ql.arch.type == QL_ARCH.ARM64:
-                            load_regions[-1] = (prev_lbound, ubound, prev_perms | perms)
-                            continue
+            load_regions: Sequence[Tuple[int, int, int]] = []
 
-                        raise RuntimeError
+            for lbound, ubound in zip(bounds, bounds[1:]):
+                covered = False
+                perms = UC_PROT_NONE
 
+                for span_lbound, span_ubound, span_perms in spans:
+                    if span_lbound <= lbound and ubound <= span_ubound:
+                        covered = True
+                        perms |= span_perms
+
+                # parts not covered by any span are gaps between segments; do not map them
+                if not covered:
+                    continue
+
+                # same perms as the previous part? extend its memory region
+                if load_regions and load_regions[-1][1] == lbound and load_regions[-1][2] == perms:
+                    load_regions[-1] = (load_regions[-1][0], ubound, perms)
+
+                # start a new memory region
                 else:
                     load_regions.append((lbound, ubound, perms))
 
             # map the memory regions
             for lbound, ubound, perms in load_regions:
-                size = ubound - lbound
-
-                # there might be a region with zero size. in this case, do not mmap it
-                if size:
-                    try:
-                        self.ql.mem.map(lbound, size, perms, os.path.basename(info))
-                    except QlMemoryMappedError:
-                        self.ql.log.exception(f'Failed to map {lbound:#x}-{ubound:#x}')
-                    else:
-                        self.ql.log.debug(f'Mapped {lbound:#x}-{ubound:#x}')
+                try:
+                    self.ql.mem.map(lbound, ubound - lbound, perms, os.path.basename(info))
+                except QlMemoryMappedError:
+                    self.ql.log.exception(f'Failed to map {lbound:#x}-{ubound:#x}')
+                else:
+                    self.ql.log.debug(f'Mapped {lbound:#x}-{ubound:#x}')
 
             # load loadable segments contents to memory
             for seg in load_segments:

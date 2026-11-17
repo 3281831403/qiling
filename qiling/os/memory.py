@@ -175,25 +175,49 @@ class QlMemoryManager:
             # nothing to do
             return
 
-        try:
-            # locate the map info entry to change
-            entry = next(entry for entry in self.map_info if mem_s >= entry[0] and mem_e <= entry[1])
-        except StopIteration:
+        # locate all map info entries overlapping the specified range
+        overlap_ranges = [idx for idx, (lbound, ubound, _, _, _) in enumerate(self.map_info) if (mem_s < ubound) and (mem_e > lbound)]
+
+        if not overlap_ranges:
             self.ql.log.error(f'Cannot change mapinfo at {mem_s:#08x}-{mem_e:#08x}')
             return
 
-        _, _, perms, info, mmio_ctx = entry
+        def __split_overlaps():
+            for idx in overlap_ranges:
+                lbound, ubound, perms, label, mmio_ctx = self.map_info[idx]
 
-        # caller wants to change perms?
-        if new_perms is not None:
-            perms = new_perms
+                # part of the entry preceding the specified range, if any, remains unchanged
+                if lbound < mem_s:
+                    yield (lbound, mem_s, perms, label, mmio_ctx)
 
-        # caller wants to change info?
-        if new_info is not None:
-            info = new_info
+                # the part covered by the specified range gets the new perms / info
+                yield (
+                    max(lbound, mem_s),
+                    min(ubound, mem_e),
+                    perms if new_perms is None else new_perms,
+                    label if new_info is None else new_info,
+                    mmio_ctx
+                )
 
-        self.del_mapinfo(mem_s, mem_e)
-        self.add_mapinfo(mem_s, mem_e, perms, info, mmio_ctx)
+                # part of the entry succeeding the specified range, if any, remains unchanged
+                if mem_e < ubound:
+                    yield (mem_e, ubound, perms, label, mmio_ctx)
+
+        # indices of first and last overlapping ranges. since map info is always
+        # sorted, we know that all overlapping rages are consecutive, so i1 > i0
+        i0 = overlap_ranges[0]
+        i1 = overlap_ranges[-1]
+
+        # create new entries by splitting overlapping ranges.
+        # this has to be done before removing overlapping entries
+        new_entries = tuple(__split_overlaps())
+
+        # remove overlapping entries
+        del self.map_info[i0:i1 + 1]
+
+        # add new ones
+        for entry in new_entries:
+            bisect.insort(self.map_info, entry)
 
     def get_mapinfo(self) -> Sequence[Tuple[int, int, str, str, str]]:
         """Get memory map info.
