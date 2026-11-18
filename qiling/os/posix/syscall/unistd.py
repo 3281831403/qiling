@@ -417,9 +417,13 @@ def ql_syscall_read(ql: Qiling, fd: int, buf: int, length: int):
         data = f.read(length)
     except IsADirectoryError:
         return -EISDIR
+    except BlockingIOError:
+        return -EAGAIN
     except ConnectionError:
         ql.log.debug('read failed due to a connection error')
         return -EIO
+    except OSError as e:
+        return -(e.errno or EIO)
 
     ql.mem.write(buf, data)
     ql.log.debug(f'read() CONTENT: {bytes(data)}')
@@ -443,14 +447,19 @@ def ql_syscall_write(ql: Qiling, fd: int, buf: int, count: int):
     data = ql.mem.read(buf, count)
 
     try:
-        f.write(data)
+        ret = f.write(data)
+    except BlockingIOError:
+        return -EAGAIN
     except ConnectionError:
         ql.log.debug('write failed due to a connection error')
         return -EIO
+    except OSError as e:
+        return -(e.errno or EIO)
 
     ql.log.debug(f'write() CONTENT: {bytes(data)}')
 
-    return count
+    # file-like objects that do not report a written count keep the previous behavior
+    return count if ret is None else ret
 
 
 def __do_readlink(ql: Qiling, absvpath: str, outbuf: int) -> int:
@@ -665,12 +674,19 @@ def ql_syscall_dup(ql: Qiling, oldfd: int):
     if f is None:
         return -EBADF
 
+    if not hasattr(f, 'dup'):
+        ql.log.debug(f'dup failed since fd {oldfd:d} does not have a dup method')
+        return -EBADF
+
     newfd = next((i for i in range(NR_OPEN) if ql.os.fd[i] is None), -1)
 
     if newfd == -1:
         return -EMFILE
 
-    ql.os.fd[newfd] = f.dup()
+    try:
+        ql.os.fd[newfd] = f.dup()
+    except OSError as e:
+        return -(e.errno or EIO)
 
     ql.log.debug(f'dup({oldfd:d}) = {newfd:d}')
 
@@ -686,12 +702,25 @@ def ql_syscall_dup2(ql: Qiling, oldfd: int, newfd: int):
     if newfd not in range(NR_OPEN):
         return -EBADF
 
+    # dup2 with identical fds is a successful no-op
+    if oldfd == newfd:
+        return newfd
+
+    if not hasattr(f, 'dup'):
+        ql.log.debug(f'dup2 failed since fd {oldfd:d} does not have a dup method')
+        return -EBADF
+
+    try:
+        newf = f.dup()
+    except OSError as e:
+        return -(e.errno or EIO)
+
     newslot = ql.os.fd[newfd]
 
     if newslot is not None:
         newslot.close()
 
-    ql.os.fd[newfd] = f.dup()
+    ql.os.fd[newfd] = newf
 
     ql.log.debug(f'dup2({oldfd:d}, {newfd:d}) = {newfd:d}')
 
@@ -704,6 +733,9 @@ def ql_syscall_dup3(ql: Qiling, oldfd: int, newfd: int, flags: int):
     if oldfd == newfd:
         return -EINVAL
 
+    if flags & ~O_CLOEXEC:
+        return -EINVAL
+
     f = get_opened_fd(ql.os, oldfd)
 
     if f is None:
@@ -712,12 +744,19 @@ def ql_syscall_dup3(ql: Qiling, oldfd: int, newfd: int, flags: int):
     if newfd not in range(NR_OPEN):
         return -EBADF
 
+    if not hasattr(f, 'dup'):
+        ql.log.debug(f'dup3 failed since fd {oldfd:d} does not have a dup method')
+        return -EBADF
+
+    try:
+        newf = f.dup()
+    except OSError as e:
+        return -(e.errno or EIO)
+
     newslot = ql.os.fd[newfd]
 
     if newslot is not None:
         newslot.close()
-
-    newf = f.dup()
 
     if flags & O_CLOEXEC:
         newf.close_on_exec = True

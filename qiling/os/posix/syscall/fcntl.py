@@ -9,7 +9,6 @@ from qiling import Qiling
 from qiling.const import QL_OS, QL_ARCH
 from qiling.os.posix.const import *
 from qiling.os.posix.const_mapping import ql_open_flag_mapping, get_open_flags_class
-from qiling.os.posix.filestruct import ql_socket
 
 from .unistd import virtual_abspath_at, get_opened_fd
 
@@ -80,23 +79,36 @@ def ql_syscall_creat(ql: Qiling, filename: int, mode: int):
     return regreturn
 
 
-def ql_syscall_fcntl(ql: Qiling, fd: int, cmd: int, arg: int):
+def __do_fcntl(ql: Qiling, fd: int, cmd: int, arg: int) -> int:
     f = get_opened_fd(ql.os, fd)
 
     if f is None:
         return -EBADF
 
-    if cmd == F_DUPFD:
+    if cmd in (F_DUPFD, F_DUPFD_CLOEXEC):
         if arg not in range(NR_OPEN):
-            regreturn = -EINVAL
+            return -EINVAL
 
-        for idx in range(arg, len(ql.os.fd)):
-            if ql.os.fd[idx] is None:
-                ql.os.fd[idx] = f.dup()
-                regreturn = idx
-                break
-        else:
-            regreturn = -EMFILE
+        if not hasattr(f, 'dup'):
+            ql.log.debug(f'fcntl failed since fd {fd:d} does not have a dup method')
+            return -EBADF
+
+        # look for the lowest available fd slot at or above arg
+        idx = next((i for i in range(arg, NR_OPEN) if ql.os.fd[i] is None), -1)
+
+        if idx == -1:
+            return -EMFILE
+
+        try:
+            newf = f.dup()
+        except OSError as e:
+            return -(e.errno or EIO)
+
+        # F_DUPFD clears close-on-exec on the new fd; F_DUPFD_CLOEXEC sets it
+        newf.close_on_exec = (cmd == F_DUPFD_CLOEXEC)
+        ql.os.fd[idx] = newf
+
+        regreturn = idx
 
     elif cmd == F_GETFD:
         regreturn = int(getattr(f, "close_on_exec", False))
@@ -106,7 +118,8 @@ def ql_syscall_fcntl(ql: Qiling, fd: int, cmd: int, arg: int):
         regreturn = 0
 
     elif cmd == F_GETFL:
-        regreturn = f.fcntl(cmd, arg)
+        ret = f.fcntl(cmd, arg)
+        regreturn = -EIO if ret is None else ret
 
     elif cmd == F_SETFL:
         flags = ql_open_flag_mapping(ql, arg)
@@ -119,46 +132,12 @@ def ql_syscall_fcntl(ql: Qiling, fd: int, cmd: int, arg: int):
     return regreturn
 
 
+def ql_syscall_fcntl(ql: Qiling, fd: int, cmd: int, arg: int):
+    return __do_fcntl(ql, fd, cmd, arg)
+
+
 def ql_syscall_fcntl64(ql: Qiling, fd: int, cmd: int, arg: int):
-    if fd not in range(NR_OPEN):
-        return -1
-
-    f = ql.os.fd[fd]
-
-    if f is None:
-        return -1
-
-    # https://linux.die.net/man/2/fcntl64
-    if cmd == F_DUPFD:
-        if arg not in range(NR_OPEN):
-            regreturn = -1
-
-        for idx in range(arg, len(ql.os.fd)):
-            if ql.os.fd[idx] is None:
-                ql.os.fd[idx] = f.dup()
-                regreturn = idx
-                break
-        else:
-            regreturn = -1
-
-    elif cmd == F_GETFL:
-        regreturn = 2
-
-    elif cmd == F_SETFL:
-        if isinstance(f, ql_socket):
-            f.fcntl(cmd, arg)
-        regreturn = 0
-
-    elif cmd == F_GETFD:
-        regreturn = 2
-
-    elif cmd == F_SETFD:
-        regreturn = 0
-
-    else:
-        regreturn = 0
-
-    return regreturn
+    return __do_fcntl(ql, fd, cmd, arg)
 
 
 def ql_syscall_flock(ql: Qiling, fd: int, operation: int):

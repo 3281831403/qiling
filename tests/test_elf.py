@@ -836,6 +836,186 @@ class ELFTest(unittest.TestCase):
 
         del ql
 
+    # Regression for the posix fd layer: dup2 self-copy used to close the fd
+    # and then dup the closed host handle, crashing the emulation with a host
+    # OSError. dup2 with identical fds must be a successful no-op instead.
+    def test_linux_fd_dup(self):
+        from qiling.os.posix.const import EBADF, EINVAL, NR_OPEN
+        from qiling.os.posix.filestruct import ql_pipe
+        from qiling.os.posix.syscall.unistd import ql_syscall_dup, ql_syscall_dup2, ql_syscall_dup3
+
+        ql = Qiling(code=b"\x00\x00\x00\x00", archtype=QL_ARCH.X8664, ostype=QL_OS.LINUX, verbose=QL_VERBOSE.OFF)
+
+        rd, wd = ql_pipe.open()
+        ql.os.fd[10] = rd
+        ql.os.fd[11] = wd
+
+        # dup2 self-copy is a successful no-op: the slot keeps the same object
+        self.assertEqual(ql_syscall_dup2(ql, 10, 10), 10)
+        self.assertIs(ql.os.fd[10], rd)
+
+        # dup2 onto an occupied slot replaces it; out-of-range and unopened fds are rejected
+        self.assertEqual(ql_syscall_dup2(ql, 10, 11), 11)
+        self.assertIsNot(ql.os.fd[11], wd)
+        self.assertEqual(ql_syscall_dup2(ql, 10, NR_OPEN), -EBADF)
+        self.assertEqual(ql_syscall_dup2(ql, 42, 12), -EBADF)
+
+        # dup allocates the lowest free slot (0-2 are stdio, 10-11 are taken)
+        self.assertEqual(ql_syscall_dup(ql, 10), 3)
+        self.assertEqual(ql_syscall_dup(ql, 42), -EBADF)
+
+        # dup3: same-fd and unknown flags are rejected; O_CLOEXEC controls close-on-exec
+        O_CLOEXEC = 0o2000000
+
+        self.assertEqual(ql_syscall_dup3(ql, 10, 10, 0), -EINVAL)
+        self.assertEqual(ql_syscall_dup3(ql, 10, 20, 0x8000), -EINVAL)
+        self.assertEqual(ql_syscall_dup3(ql, 10, 20, O_CLOEXEC), 20)
+        self.assertTrue(ql.os.fd[20].close_on_exec)
+        self.assertEqual(ql_syscall_dup3(ql, 10, 21, 0), 21)
+        self.assertFalse(getattr(ql.os.fd[21], 'close_on_exec', False))
+
+        for f in {f for f in ql.os.fd if isinstance(f, ql_pipe)}:
+            f.close()
+
+        del ql
+
+    # Regression: dup'd fds must share the file offset with the original.
+    def test_linux_fd_dup_shared_offset(self):
+        import tempfile
+
+        from qiling.os.filestruct import ql_file
+        from qiling.os.posix.syscall.unistd import ql_syscall_dup
+
+        ql = Qiling(code=b"\x00\x00\x00\x00", archtype=QL_ARCH.X8664, ostype=QL_OS.LINUX, verbose=QL_VERBOSE.OFF)
+
+        hostfd, hpath = tempfile.mkstemp()
+        os.write(hostfd, b'0123456789abcdef')
+        os.close(hostfd)
+
+        f = ql_file.open(hpath, os.O_RDWR, 0)
+        ql.os.fd[10] = f
+
+        newfd = ql_syscall_dup(ql, 10)
+        self.assertEqual(newfd, 3)
+
+        # seeking through one fd must be observable through the other
+        f.lseek(7, os.SEEK_SET)
+        self.assertEqual(ql.os.fd[newfd].tell(), 7)
+
+        ql.os.fd[newfd].close()
+        f.close()
+        os.unlink(hpath)
+
+        del ql
+
+    # Regression for fcntl/fcntl64: fcntl64 used to ignore F_SETFD, report
+    # made-up F_GETFD/F_GETFL values, apply F_SETFL only to sockets and return
+    # -1 for every error. Both syscalls must handle FD flags, slot allocation
+    # and error codes identically.
+    def test_linux_fd_fcntl(self):
+        from qiling.os.posix.const import EBADF, EINVAL, NR_OPEN, FD_CLOEXEC
+        from qiling.os.posix.filestruct import ql_pipe
+        from qiling.os.posix.syscall.fcntl import ql_syscall_fcntl, ql_syscall_fcntl64
+
+        F_DUPFD, F_GETFD, F_SETFD = 0, 1, 2
+        F_DUPFD_CLOEXEC = 1030
+
+        ql = Qiling(code=b"\x00\x00\x00\x00", archtype=QL_ARCH.X8664, ostype=QL_OS.LINUX, verbose=QL_VERBOSE.OFF)
+
+        rd, wd = ql_pipe.open()
+        ql.os.fd[10] = rd
+        ql.os.fd[11] = wd
+
+        # FD flags: fcntl and fcntl64 must agree
+        self.assertEqual(ql_syscall_fcntl(ql, 10, F_SETFD, FD_CLOEXEC), 0)
+        self.assertEqual(ql_syscall_fcntl(ql, 10, F_GETFD, 0), FD_CLOEXEC)
+        self.assertEqual(ql_syscall_fcntl64(ql, 10, F_GETFD, 0), FD_CLOEXEC)
+        self.assertEqual(ql_syscall_fcntl64(ql, 10, F_SETFD, 0), 0)
+        self.assertEqual(ql_syscall_fcntl(ql, 10, F_GETFD, 0), 0)
+        self.assertEqual(ql_syscall_fcntl64(ql, 10, F_GETFD, 0), 0)
+
+        # F_DUPFD allocates the lowest slot at or above arg and clears close-on-exec
+        self.assertEqual(ql_syscall_fcntl(ql, 10, F_SETFD, FD_CLOEXEC), 0)
+        self.assertEqual(ql_syscall_fcntl(ql, 10, F_DUPFD, 5), 5)
+        self.assertEqual(ql_syscall_fcntl(ql, 5, F_GETFD, 0), 0)
+
+        # F_DUPFD_CLOEXEC allocates likewise but sets close-on-exec
+        self.assertEqual(ql_syscall_fcntl64(ql, 10, F_DUPFD_CLOEXEC, 6), 6)
+        self.assertEqual(ql_syscall_fcntl64(ql, 6, F_GETFD, 0), FD_CLOEXEC)
+
+        # arg at or above NR_OPEN is invalid
+        self.assertEqual(ql_syscall_fcntl(ql, 10, F_DUPFD, NR_OPEN), -EINVAL)
+        self.assertEqual(ql_syscall_fcntl64(ql, 10, F_DUPFD, NR_OPEN), -EINVAL)
+
+        # bad fds and unknown commands are rejected consistently
+        self.assertEqual(ql_syscall_fcntl(ql, 42, F_GETFD, 0), -EBADF)
+        self.assertEqual(ql_syscall_fcntl64(ql, 42, F_GETFD, 0), -EBADF)
+        self.assertEqual(ql_syscall_fcntl(ql, 10, 0xdead, 0), -EINVAL)
+        self.assertEqual(ql_syscall_fcntl64(ql, 10, 0xdead, 0), -EINVAL)
+
+        for f in {f for f in ql.os.fd if isinstance(f, ql_pipe)}:
+            f.close()
+
+        del ql
+
+    # Regression for read/write: host exceptions used to escape the syscall
+    # layer (crashing the emulation on a non-blocking pipe read or a
+    # wrong-direction access), and write always reported the full requested
+    # count even when fewer bytes were written.
+    def test_linux_fd_read_write(self):
+        from qiling.os.posix.const import EBADF, EAGAIN, NR_OPEN
+        from qiling.os.posix.filestruct import ql_pipe
+        from qiling.os.posix.syscall.fcntl import ql_syscall_fcntl, ql_syscall_fcntl64
+        from qiling.os.posix.syscall.unistd import ql_syscall_read, ql_syscall_write
+
+        F_SETFL = 4
+        O_NONBLOCK = 0o4000   # x86-64 linux O_NONBLOCK
+
+        ql = Qiling(code=b"\x00\x00\x00\x00", archtype=QL_ARCH.X8664, ostype=QL_OS.LINUX, verbose=QL_VERBOSE.OFF)
+
+        rd, wd = ql_pipe.open()
+        ql.os.fd[10] = rd
+        ql.os.fd[11] = wd
+
+        base = 0x100000
+        ql.mem.map(base, 0x1000)
+        ql.mem.write(base, b'A' * 16)
+
+        # wrong direction: EBADF, not a host exception
+        self.assertEqual(ql_syscall_read(ql, 11, base, 16), -EBADF)
+        self.assertEqual(ql_syscall_write(ql, 10, base, 16), -EBADF)
+
+        # non-blocking read on an empty pipe reports EAGAIN; F_SETFL must reach
+        # the pipe through both fcntl and fcntl64
+        self.assertEqual(ql_syscall_fcntl(ql, 10, F_SETFL, O_NONBLOCK), 0)
+        self.assertEqual(ql_syscall_read(ql, 10, base, 16), -EAGAIN)
+        self.assertEqual(ql_syscall_fcntl64(ql, 10, F_SETFL, O_NONBLOCK), 0)
+        self.assertEqual(ql_syscall_read(ql, 10, base, 16), -EAGAIN)
+
+        # a short write reports the actual number of bytes written
+        class HalvingWriter:
+            def write(self, data):
+                return len(data) // 2
+
+        ql.os.fd[12] = HalvingWriter()
+        self.assertEqual(ql_syscall_write(ql, 12, base, 16), 8)
+
+        # the fd table rejects negative and out-of-range indexing
+        ql.os.fd[NR_OPEN - 1] = wd
+        self.assertIsNone(ql.os.fd[-1])
+        self.assertIsNone(ql.os.fd[NR_OPEN])
+
+        with self.assertRaises(IndexError):
+            ql.os.fd[NR_OPEN] = None
+
+        with self.assertRaises(IndexError):
+            ql.os.fd[-1] = None
+
+        for f in {f for f in ql.os.fd if isinstance(f, ql_pipe)}:
+            f.close()
+
+        del ql
+
     def test_memory_search(self):
         ql = Qiling(code=b"\xCC", archtype=QL_ARCH.X8664, ostype=QL_OS.LINUX, verbose=QL_VERBOSE.DEBUG)
 

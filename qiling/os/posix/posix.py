@@ -27,9 +27,16 @@ class QlFileDes:
         return len(self.__fds)
 
     def __getitem__(self, idx: int):
+        # out-of-range and negative indexes are treated as unopened fds
+        if idx not in range(NR_OPEN):
+            return None
+
         return self.__fds[idx]
 
     def __setitem__(self, idx: int, val: Optional[IO]):
+        if idx not in range(NR_OPEN):
+            raise IndexError(f'fd {idx} is out of range')
+
         self.__fds[idx] = val
 
     def __iter__(self):
